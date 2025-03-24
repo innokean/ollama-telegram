@@ -418,7 +418,10 @@ async def handle_response(message, response_data, full_response):
     if full_response_stripped == "":
         return
     if response_data.get("done"):
-        text = f"{full_response_stripped}\n\n⚙️ {modelname}\nGenerated in {response_data.get('total_duration') / 1e9:.2f}s."
+        text = full_response_stripped
+        logging.info(
+            f"[Response]: ⚙️ {modelname}\nGenerated in {response_data.get('total_duration') / 1e9:.2f}s."
+        )
         await send_response(message, text)
         async with ACTIVE_CHATS_LOCK:
             if ACTIVE_CHATS.get(message.from_user.id) is not None:
@@ -474,8 +477,15 @@ async def ollama_request(message: types.Message, prompt: str = None):
                 if system_prompt is None:
                     logging.warning(f"Selected prompt ID {selected_prompt_id} not found for user {message.from_user.id}")
 
+        if system_prompt == None:
+            system_prompt = os.getenv("OLLAMA_SYSTEM_PROMPT")
+
         # Save the user's message
         save_chat_message(message.from_user.id, "user", prompt)
+
+        logging.info(
+            f"[OllamaAPI]: System prompt for {message.from_user.first_name} {message.from_user.last_name}: {system_prompt}"
+        )
 
         # Prepare the active chat with the system prompt
         await add_prompt_to_active_chats(message, prompt, image_base64, modelname, system_prompt)
