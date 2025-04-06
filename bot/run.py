@@ -43,6 +43,17 @@ commands = [
     types.BotCommand(command="addglobalprompt", description="Add a global prompt"),
     types.BotCommand(command="addprivateprompt", description="Add a private prompt"),
 ]
+if os.getenv("TELEGRAM_BOT") == None:
+    botname = ""
+else:
+    botname = os.getenv("TELEGRAM_NICKNAMES")
+
+if os.getenv("TELEGRAM_NICKNAMES") == None:
+    nicknames = {}
+else:
+    nicknames = json.loads(os.getenv("TELEGRAM_NICKNAMES"))
+    for name in nicknames:
+        logging.info(f"{name} is {nicknames[name]}")
 
 ACTIVE_CHATS = {}
 ACTIVE_CHATS_LOCK = contextLock()
@@ -51,6 +62,7 @@ mention = None
 selected_prompt_id = None  # Variable to store the selected prompt ID
 CHAT_TYPE_GROUP = "group"
 CHAT_TYPE_SUPERGROUP = "supergroup"
+MAX_THREAD_DEPTH = 10
 
 def init_db():
     conn = sqlite3.connect('users.db')
@@ -73,6 +85,19 @@ def init_db():
                   FOREIGN KEY (user_id) REFERENCES users(id))''')
     conn.commit()
     conn.close()
+
+# The original implementation maintained individual user chat histories.
+# We want to have group histories in which the group context is shared across all users.
+# So we will modify ACTIVE_CHATS dictionary to accommodate group chat history.
+# We create a function that gets the appropriate context key and that context_key
+# will replace all references to message.from_user.id) and message.from_user.first_name
+# where appropriate.
+def get_context_key(message):
+    # For group chats, use the chat ID
+    if message.chat.type in [CHAT_TYPE_GROUP, CHAT_TYPE_SUPERGROUP]:
+        return f"group_{message.chat.id}"
+    # For private chats, use the user ID
+    return f"user_{message.from_user.id}"
 
 def register_user(user_id, user_name):
     conn = sqlite3.connect('users.db')
@@ -116,10 +141,11 @@ async def command_start_handler(message: Message) -> None:
 @dp.message(Command("reset"))
 async def command_reset_handler(message: Message) -> None:
     if message.from_user.id in allowed_ids:
-        if message.from_user.id in ACTIVE_CHATS:
+        context_key = get_context_key(message)
+        if context_key in ACTIVE_CHATS:
             async with ACTIVE_CHATS_LOCK:
-                ACTIVE_CHATS.pop(message.from_user.id)
-            logging.info(f"Chat has been reset for {message.from_user.first_name}")
+                ACTIVE_CHATS.pop(context_key)
+            logging.info(f"Chat has been reset for {context_key}")
             await bot.send_message(
                 chat_id=message.chat.id,
                 text="Chat has been reset",
@@ -350,25 +376,40 @@ async def is_mentioned_in_group_or_supergroup(message: types.Message):
     
     return is_mentioned or is_reply_to_bot
 
-async def collect_message_thread(message: types.Message, thread=None):
+async def collect_message_thread(message: types.Message, thread=None, depth=0, max_depth=MAX_THREAD_DEPTH):
     if thread is None:
         thread = []
     
+    if depth >= max_depth:  # Prevent infinite recursion
+        return thread
+
     thread.insert(0, message)
     
     if message.reply_to_message:
-        await collect_message_thread(message.reply_to_message, thread)
+        await collect_message_thread(message.reply_to_message, thread, depth + 1, max_depth)
     
     return thread
 
 def format_thread_for_prompt(thread):
     prompt = "Conversation thread:\n\n"
     for msg in thread:
-        sender = "User" if msg.from_user.id != bot.id else "Bot"
+        # Replace User with nickname or first name to separate users in joint conversation
+        #sender = "User" if msg.from_user.id != bot.id else "Bot"
+        if msg.from_user.first_name in nicknames:
+            name = nicknames[msg.from_user.first_name]
+        else:
+            name = msg.from_user.first_name
+        sender = f"{name}" if msg.from_user.id != bot.id else "Bot"
         content = msg.text or msg.caption or "[No text content]"
         prompt += f"{sender}: {content}\n\n"
-    
-    prompt += "History:"
+
+    prompt += "Please respond to the latest message while considering the context above."
+    # This "History:" appendix was in the original implementation but why?"
+    #prompt += "History:"
+
+    # TESTING - Here is a simplified version which avoids all above
+    prompt = f"{nicknames[msg.from_user.first_name]}: " + msg.text.replace(f"@{botname}", "").strip()
+
     return prompt
 
 async def process_image(message):
@@ -413,7 +454,54 @@ async def add_prompt_to_active_chats(message, prompt, image_base64, modelname, s
             "stream": True,
         }
 
-async def handle_response(message, response_data, full_response):
+# Alternative to add_prompt_to_active_chats modified to use context_key instead of user ID
+async def add_prompt_to_active_group_chats(message, prompt, image_base64, modelname, context_key, system_prompt=None):
+        async with ACTIVE_CHATS_LOCK:
+            # Prepare the messages list
+            messages = []
+
+            # Add system prompt if provided and not already present
+            if system_prompt:
+                # Check if a system message already exists
+                existing_system_messages = [msg for msg in ACTIVE_CHATS.get(context_key, {}).get('messages', []) if msg.get('role') == 'system']
+
+                if not existing_system_messages:
+                    messages.append({
+                        "role": "system",
+                        "content": system_prompt
+                    })
+
+            # Add existing messages if the chat exists, excluding any existing system messages
+            if ACTIVE_CHATS.get(context_key):
+                messages.extend([msg for msg in ACTIVE_CHATS[context_key].get("messages", []) if msg.get('role') != 'system'])
+
+            # Add the new user message with user identification for group chats
+            if message.chat.type in [CHAT_TYPE_GROUP, CHAT_TYPE_SUPERGROUP]:
+                # TODO: change this to mapped nickname
+                user_prefix = f"{message.from_user.first_name}: "
+                messages.append({
+                    "role": "user",
+                    #"content": user_prefix + prompt,
+                    "content": prompt,
+                    "images": ([image_base64] if image_base64 else []),
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": prompt,
+                    "images": ([image_base64] if image_base64 else []),
+                })
+
+            # Update or create the active chat
+            ACTIVE_CHATS[context_key] = {
+                "model": modelname,
+                "messages": messages,
+                "stream": True,
+            }
+
+# Added context_key arg for being able to get the right chat
+# Previous implementation of chat used message.from_user.id
+async def handle_response(message, response_data, full_response, context_key):
     full_response_stripped = full_response.strip()
     if full_response_stripped == "":
         return
@@ -424,8 +512,8 @@ async def handle_response(message, response_data, full_response):
         )
         await send_response(message, text)
         async with ACTIVE_CHATS_LOCK:
-            if ACTIVE_CHATS.get(message.from_user.id) is not None:
-                ACTIVE_CHATS[message.from_user.id]["messages"].append(
+            if ACTIVE_CHATS.get(context_key) is not None:
+                ACTIVE_CHATS[context_key]["messages"].append(
                     {"role": "assistant", "content": full_response_stripped}
                 )
         logging.info(
@@ -453,6 +541,7 @@ async def send_response(message, text):
             parse_mode="MarkdownV2"
         )
 
+# Update ollama_request function with extraction of context_key
 async def ollama_request(message: types.Message, prompt: str = None):
     try:
         full_response = ""
@@ -463,8 +552,12 @@ async def ollama_request(message: types.Message, prompt: str = None):
         if prompt is None:
             prompt = message.text or message.caption
 
+        # Get context key for this conversation
+        context_key = get_context_key(message)
+
         # Retrieve and prepare system prompt if selected
         system_prompt = None
+
         if selected_prompt_id is not None:
             system_prompts = get_system_prompts(user_id=message.from_user.id, is_global=None)
             if system_prompts:
@@ -488,17 +581,19 @@ async def ollama_request(message: types.Message, prompt: str = None):
         )
 
         # Prepare the active chat with the system prompt
-        await add_prompt_to_active_chats(message, prompt, image_base64, modelname, system_prompt)
+        #await add_prompt_to_active_chats(message, prompt, image_base64, modelname, system_prompt)
+        await add_prompt_to_active_group_chats(message, prompt, image_base64, modelname, context_key, system_prompt)
         
         logging.info(
             f"[OllamaAPI]: Processing '{prompt}' for {message.from_user.first_name} {message.from_user.last_name}"
         )
         
         # Get the payload from active chats
-        payload = ACTIVE_CHATS.get(message.from_user.id)
+        payload = ACTIVE_CHATS.get(context_key)
         
         # Generate response
         async for response_data in generate(payload, modelname, prompt):
+            # Also update handle_response to use context_key
             msg = response_data.get("message")
             if msg is None:
                 continue
@@ -506,7 +601,7 @@ async def ollama_request(message: types.Message, prompt: str = None):
             full_response += chunk
 
             if any([c in chunk for c in ".\n!?"]) or response_data.get("done"):
-                if await handle_response(message, response_data, full_response):
+                if await handle_response(message, response_data, full_response, context_key):
                     save_chat_message(message.from_user.id, "assistant", full_response)
                     break
 
